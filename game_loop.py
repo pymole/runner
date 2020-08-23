@@ -54,6 +54,8 @@ class GameLoop:
             for dead_client in dead_clients:
                 self.disconnect_client(dead_client)
 
+        self.game.save_log('result.json')
+
     async def get_commands(self):
         client_ids = list(self.clients.keys())
         commands = await asyncio.gather(*(self.get_command_wrapper(client_id) for client_id in client_ids))

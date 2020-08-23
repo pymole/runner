@@ -9,4 +9,3 @@
 # game = Game(map_width, map_height, units)
 # print(game)
 
-print(dict(enumerate(range(1000), start=1)))

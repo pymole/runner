@@ -1,10 +1,15 @@
+from itertools import chain
 from collections import defaultdict, Counter
-from exceptions import InitializationError
+import json
+
+from exceptions import InitializationError, InvalidAction
 from utils import is_coordinate, inside_rectangle
+from actions import Fire, create_action, split_actions
 
 
 class Game:
-    __slots__ = ('width', 'height', 'units', 'ticks', 'team_count', 'remaining_teams')
+    __slots__ = ('width', 'height', 'units', 'ticks', 'team_count', 'remaining_teams',
+                 'map_config', 'log')
 
     def __init__(self, width, height, teams):
         self.width = width
@@ -12,7 +17,17 @@ class Game:
 
         self.units = self.validate_teams(teams)
         self.remaining_teams = set(range(len(teams)))
-        self.ticks = 0
+
+        self.map_config = {
+            'map_width': self.width,
+            'map_height': self.height,
+            'units': [
+                {'id': unit.id, 'spawn_x': unit.spawn[0], 'spawn_y': unit.spawn[1], 'team': unit.team}
+                for unit in self.units.values()
+            ]
+        }
+
+        self.log = []
 
     def validate_teams(self, teams):
         # TODO spawns
@@ -67,7 +82,7 @@ class Game:
                     if not inside_rectangle(self.width, self.height, *spawn):
                         raise InitializationError('Position of units must be inside a game field')
 
-                units[unit_id] = Unit(team_id, spawn, position)
+                units[unit_id] = Unit(unit_id, team_id, spawn, position)
                 spawn_positions.add(spawn)
                 unit_positions.add(position)
 
@@ -94,103 +109,100 @@ class Game:
 
     def __str__(self):
         field = [['-' for _ in range(self.width)] for _ in range(self.height)]
-        for unit_id, unit in self.units.items():
+        for unit in self.units.values():
             pos_x, pos_y = unit.position
             spawn_x, spawn_y = unit.spawn
-            field[spawn_y][spawn_x] = 'X' + str(unit_id)
-            field[pos_y][pos_x] = str(unit.team) + str(unit_id)
+            field[spawn_y][spawn_x] = 'X' + str(unit.id)
+            field[pos_y][pos_x] = str(unit.team) + str(unit.id)
 
         return '\n'.join('\t'.join(row) for row in field)
 
-    def tick(self, team_actions):
-        """One game tick"""
-        actions = self.filter_team_actions(team_actions)
-        move_actions, fire_actions = self.validate_and_split_actions(actions)
-        self.resolve_move_conflicts(move_actions)
-        dead_ids = self.spawn_kills()
+    def __len__(self):
+        return len(self.log)
+
+    def tick(self, team_commands):
+        actions = self.validate_commands(team_commands)
+        move_actions, fire_actions = split_actions(actions)
+        busy_positions, non_conflict_moves = self.resolve_move_conflicts(move_actions)
+
+        for move_action in non_conflict_moves:
+            move_action.apply(busy_positions)
+
+        dead_units = self.spawn_kills()
         # dead units can't fire
-        fire_actions = [action for action in fire_actions if action.unit_id not in dead_ids]
+        fire_actions = [action for action in fire_actions if action.unit not in dead_units]
+
         self.fire(fire_actions)
         self.refresh_remaining_teams()
 
-        self.ticks += 1
+        tick_log = {
+            'units': [unit.render_state() for unit in self.units.values()],
+            'actions': [action.render() for action in chain(non_conflict_moves, fire_actions)]
+        }
 
-    def filter_team_actions(self, team_actions):
+        self.log.append(tick_log)
+
+    def validate_commands(self, team_commands):
         valid_actions = []
-        for team, actions in team_actions.items():
-            for action in actions:
+        for team, command in team_commands.items():
+            for action in command:
                 # action of non-existent unit is invalid
                 try:
-                    unit = self.units[action.unit_id]
-                except KeyError:
+                    action = create_action(self, action)
+                except InvalidAction:
                     continue
 
                 # can do actions only for units of my team
-                if unit.team == team:
+                if action.unit.team == team:
                     valid_actions.append(action)
 
         return valid_actions
 
-    def validate_and_split_actions(self, actions):
-        # filter invalid moves and get groups of actions
-        move_actions = []
-        fire_actions = []
-
-        for action in actions:
-            is_valid = action.validate(self)
-            if is_valid:
-                if isinstance(action, Fire):
-                    fire_actions.append(action)
-                else:
-                    move_actions.append(action)
-
-        return move_actions, fire_actions
-
     def resolve_move_conflicts(self, move_actions):
         # the unit performs an action if no one else moves to the target
         # and target is free cell or will be free after moves
-        # TODO teleport fix
         target_moves = defaultdict(list)
         for move_action in move_actions:
             target_moves[move_action.target].append(move_action)
 
         non_conflict_moves = [moves[0] for moves in target_moves.values() if len(moves) == 1]
         # units with the same target do not move
-        is_not_moving = set(self.units.keys()) - set(move.unit_id for move in non_conflict_moves)
+        is_not_moving = set(self.units.values()) - set(move.unit for move in non_conflict_moves)
 
-        busy_positions = {self.units[unit_id].position for unit_id in is_not_moving}
-        for move_action in non_conflict_moves:
-            move_action.apply(self, busy_positions)
+        busy_positions = {unit.position for unit in is_not_moving}
+
+        return busy_positions, non_conflict_moves
 
     def spawn_kills(self):
-        dead_units_ids = set()
-        for killer_id, killer in self.units.items():
+        dead_units_ids = []
+        for killer in self.units.values():
             killer_x, killer_y = killer.position
 
-            for victim_id, victim in self.units.items():
+            for victim in self.units.values():
                 if victim.team == killer.team:
                     continue
 
                 spawn_x, spawn_y = victim.spawn
                 if abs(spawn_x - killer_x) + abs(spawn_y - killer_y) <= 1:
-                    dead_units_ids.add(victim_id)
+                    dead_units_ids.append(victim.id)
 
-        for unit_id in dead_units_ids:
-            self.units.pop(unit_id)
-
-        return dead_units_ids
+        dead_units = {self.units.pop(unit_id) for unit_id in dead_units_ids}
+        return dead_units
 
     def fire(self, fire_actions):
         for fire_action in fire_actions:
-            fire_action.apply(self)
+            fire_action.apply()
+
+    def refresh_remaining_teams(self):
+        self.remaining_teams = {unit.team for unit in self.units.values()}
 
     def get_unit_by_id(self, unit_id):
         return self.units.get(unit_id, None)
 
     def remove_unit_at(self, position):
-        for unit_id, unit in self.units.items():
+        for unit in self.units.values():
             if unit.position == position:
-                self.units.pop(unit_id)
+                self.units.pop(unit.id)
                 break
 
     def get_winners(self):
@@ -211,42 +223,32 @@ class Game:
 
         return winner_teams
 
-    def refresh_remaining_teams(self):
-        self.remaining_teams = {unit.team for unit in self.units.values()}
-
-    def get_state(self):
-        return {
-            'tick': self.ticks,
-            'units': [
-                {'id': unit_id, 'x': unit.position[0], 'y': unit.position[1]}
-                for unit_id, unit in self.units.items()
-            ]
-        }
+    def get_current_state(self):
+        return self.log[-1]
 
     def get_map_config(self, from_perspective):
-        return {
-            'my_team_id': from_perspective,
-            'map_width': self.width,
-            'map_height': self.height,
-            'units': [
-                {'id': unit_id, 'spawn_x': unit.spawn[0], 'spawn_y': unit.spawn[1], 'team': unit.team}
-                for unit_id, unit in self.units.items()
-            ]
-        }
+        return {**self.map_config, 'my_team_id': from_perspective}
+
+    def save_log(self, path):
+        with open(path, 'w') as f:
+            json.dump(self.log, f)
 
     def is_ended(self):
         return False
 
 
 class Unit:
-    __slots__ = ('team', 'position', 'spawn')
+    __slots__ = ('id', 'team', 'position', 'spawn')
 
-    def __init__(self, team, spawn, position):
+    def __init__(self, id, team, spawn, position):
+        self.id = id
         self.team = team
         self.position = position
         self.spawn = spawn
 
-
-
-
-from actions import Fire
+    def render_state(self):
+        return {
+            'id': self.id,
+            'x': self.position[0],
+            'y': self.position[1]
+        }
